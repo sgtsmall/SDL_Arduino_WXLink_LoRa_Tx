@@ -1,5 +1,10 @@
 // SDL_Arduino_WeatherLink_LoRa_Tx
 // SwitchDoc Labs April 2018
+// modified VK2PSF uses SunControl in place of SunAirPlus
+// WatchDog Grove SC to Pro Mini Grove D8/D9
+// WatchDog SC Pins to SC USB Grove
+// extended packet length of lora
+// Added/disabled Si1145 Light Sensor
 //
 #define TXDEBUG
 //#undef TXDEBUG
@@ -9,8 +14,8 @@
 
 #define LED 13
 
-#define SOFTWAREVERSION 9
-
+#define SOFTWAREVERSION 10
+#define TXPOWER 8
 // WIRELESSID is changed if you have more than one unit reporting in the same area.  It is coded in protocol as WIRELESSID*10+SOFTWAREVERSION
 #define WIRELESSID 3
 // Number of milliseconds between data out - set 1000 or or 30000 or 60000 if you are using DS3231
@@ -19,7 +24,8 @@
 // WIRELESSID is changed if you have more than one unit reporting in the same area.  It is coded in protocol as WIRELESSID*10+SOFTWAREVERSION
 //#define WIRELESSID 2
 // Number of milliseconds between data out - set 1000 or or 30000 or 60000 if you are using DS3231
-#define SLEEPCYCLE 29000
+#define SLEEPCYCLE 30000
+//#define SLEEPCYCLE 29000
 //#define SLEEPCYCLE 14000
 
 #include "Crc16.h"
@@ -46,9 +52,13 @@ SDL_Arduino_INA3221 SunAirPlus;
 
 #define ENABLE_RADIO 5
 
+#define RF95TX 6
+#define RF95RX 7
 #define WATCHDOG_1 8
 #define WATCHDOG_2 9
 
+// Grove A2/A3 16,17
+#define POWERSAVE 16
 // Number of milliseconds between data out - set 1000 or or 30000 or 60000 if you are using DS3231
 
 
@@ -77,7 +87,8 @@ SDL_Arduino_INA3221 SunAirPlus;
 
 */
 
-SoftwareSerial SoftSerial(6, 7); // TX, RX
+
+SoftwareSerial SoftSerial(RF95TX, RF95RX); // TX, RX
 #define COMSerial SoftSerial
 #define ShowSerial Serial
 
@@ -120,6 +131,7 @@ typedef enum  {
 
 bool SunAirPlus_Present;
 bool DS3231_Present;
+bool Si1145_Present;
 
 byte byteBuffer[200]; // contains string to be sent to RX unit
 
@@ -141,6 +153,10 @@ float SolarPanelCurrent;
 float AuxA;
 float AuxB;
 int protocolBufferCount;
+
+int VisLevel;
+int IRLevel;
+int UVLevel;
 
 wakestate wakeState;  // who woke us up?
 
@@ -165,7 +181,10 @@ SDL_ESP8266_HR_AM2315 am2315;
 float dataAM2315[2];  //Array to hold data returned by sensor.  [0,1] => [Humidity, Temperature]
 boolean OK;  // 1=successful read
 
+// Light sensor
+#include "SI114X.h"
 
+SI114X SI1145 = SI114X();
 
 
 //
@@ -177,7 +196,18 @@ boolean OK;  // 1=successful read
 // Wind Gust - 4 bytes - high during sample interval - float - kph
 // Outside Temperature - 4 bytes - instantenous temperature - float - degrees c
 // Outside Humidity - 4 bytes - instaneous humidity - float - % RH
-// Aux A - 4 Bytes - user defined - float
+// BatteryVoltage  - 4 bytes  instaneous Voltage - float - V
+// BatteryCurrent  - 4 bytes - instaneous current  - float - mA
+// LoadCurrent  - 4 bytes -- instaneous current  - float - mA
+// SolarPanelVoltage  - 4 bytes  instaneous Voltage - float - V
+// SolarPanelCurrent  - 4 bytes - instaneous current  - float - mA
+// LoadVoltage  - 4 bytes - instaneous Voltage - float - V
+// MessageCount);
+
+// VisLevel - 4 Bytes - level - long
+// IRLevel - 4 Bytes - level - long
+// UVLevel - 4 Bytes - level - float [float?] UV Scale
+
 // Aux B - 4 bytes - user define - float
 // Buffer Total Bytes
 //
@@ -241,12 +271,14 @@ int convert2ByteVariables(int bufferCount, int myVariable)
   bufferCount++;
   byteBuffer[bufferCount] = thing.bytes[1];
   bufferCount++;
+/*
 #if defined(TXDEBUG)
   Serial.println(F("-------"));
   Serial.println(thing.bytes[0]);
   Serial.println(thing.bytes[1]);
   Serial.println(F("------"));
 #endif
+*/
   return bufferCount;
 
 }
@@ -265,7 +297,7 @@ int checkSum(int bufferCount)
 {
   unsigned short checksumValue;
   // calculate checksum
-  checksumValue = crc.XModemCrc(byteBuffer, 0, 59);
+  checksumValue = crc.XModemCrc(byteBuffer, 0, 71);
 #if defined(TXDEBUG)
   Serial.print(F("crc = 0x"));
   Serial.println(checksumValue, HEX);
@@ -307,8 +339,13 @@ int buildProtocolString()
   bufferCount = convert4ByteFloatVariables(bufferCount, SolarPanelVoltage);
   bufferCount = convert4ByteFloatVariables(bufferCount, SolarPanelCurrent);
 
-  bufferCount = convert4ByteFloatVariables(bufferCount, AuxA);
+  bufferCount = convert4ByteFloatVariables(bufferCount, LoadVoltage);
   bufferCount = convert4ByteLongVariables(bufferCount, MessageCount);
+
+  bufferCount = convert4ByteLongVariables(bufferCount, VisLevel);
+  bufferCount = convert4ByteLongVariables(bufferCount, IRLevel);
+  bufferCount = convert4ByteLongVariables(bufferCount, UVLevel);
+
   protocolBufferCount = bufferCount + 2;
   //     bufferCount = convert1ByteVariables(bufferCount, protocolBufferCount);
   bufferCount = checkSum(bufferCount);
@@ -439,17 +476,39 @@ void ResetWatchdog()
   }
 }
 
+void ResetPowerSave()
+{
+
+#if defined(TXDEBUG)
+    Serial.println(F("Powersave -Off"));
+#endif
+    digitalWrite(POWERSAVE, LOW);
+    delay(4000);
+    digitalWrite(POWERSAVE, HIGH);
+    delay(2000);
+
+#if defined(TXDEBUG)
+    Serial.println(F("Powersave On"));
+#endif
+}
 
 
 void setup()
 {
   Serial.begin(115200);    // TXDEBUGging only
-
-  Serial.println(F("WXLink Tx Present"));
+  pinMode(POWERSAVE, OUTPUT);
+  digitalWrite(POWERSAVE, HIGH);
+  Serial.println(F("Powersave On"));
+  pinMode(WATCHDOG_1, OUTPUT);
+  digitalWrite(WATCHDOG_1, HIGH);
+  Serial.println(F("Watchdog On"));
+  // Just to turn off LED on _1_
+  //pinMode(WATCHDOG_2, OUTPUT);
+  //digitalWrite(WATCHDOG_2, HIGH);
 
   if (!rf95.init())
   {
-    Serial.println(F("init failed"));
+    Serial.println(F("RF95 init failed"));
     while (1);
   }
 
@@ -458,23 +517,11 @@ void setup()
   // The default transmitter power is 13dBm, using PA_BOOST.
   // If you are using RFM95/96/97/98 modules which uses the PA_BOOST transmitter pin, then
   // you can set transmitter powers from 5 to 23 dBm:
-  //rf95.setTxPower(13, false);
 
-      rf95.setFrequency(434.0);
-
-      int Bw31_25Cr48Sf512 = 2;
-
-      rf95.setModemConfig(RH_RF95<SoftwareSerial>::ModemConfigChoice(Bw31_25Cr48Sf512));
-      // rf95.setModemConfig(RH_RF95::Bw125Cr48Sf4096);
-
-      rf95.setTxPower(13);
-
-      //rf95.printRegisters();
-
-
-  //rf95.printRegisters();
-
-  //SoftSerial.begin(9600);
+  rf95.setFrequency(434.0);
+  int Bw31_25Cr48Sf512 = 2;
+  rf95.setModemConfig(RH_RF95<SoftwareSerial>::ModemConfigChoice(Bw31_25Cr48Sf512));
+  rf95.setTxPower(TXPOWER, false);
 
   Serial.print(F("Wireless ID:"));
   Serial.println(WIRELESSID);
@@ -528,11 +575,6 @@ void setup()
   lastWindTime = 0;
   shortestWindTime = 10000000;
 
-  pinMode(WATCHDOG_1, OUTPUT);
-  digitalWrite(WATCHDOG_1, HIGH);
-  // Just to turn off LED on _1_
-  //pinMode(WATCHDOG_2, OUTPUT);
-  //digitalWrite(WATCHDOG_2, HIGH);
 
   Wire.begin();
 
@@ -622,6 +664,21 @@ void setup()
   Serial.print(F("RTC_CONTROL="));
   Serial.println(s, BIN);
 
+// Light sensor
+  Si1145_Present = false;
+  VisLevel = 0;
+  IRLevel = 0;
+  UVLevel = 0.0;
+
+/// Disable Si1145 for now as it resets the board and bad values ? not enough power?
+///  while (!SI1145.Begin()) {
+///    Serial.println("Si1145 is not ready!");
+///    delay(1000);
+///    ResetPowerSave();
+///  }
+///  Serial.println("Si1145 is ready!");
+///  Si1145_Present = true;
+
 
   // test for SunAirPlus_Present
   SunAirPlus_Present = false;
@@ -664,10 +721,6 @@ void setup()
     SunAirPlus_Present = true;
     Serial.println(F("SunAirPlus Present"));
   }
-
-
-
-
 }
 
 
@@ -685,6 +738,7 @@ void loop()
   }
   // Only send if source is SLEEP_INTERRUPT
 #if defined(TXDEBUG)
+  Serial.println(F("Top of Loop"));
   Serial.print(F("wakeState="));
   Serial.println(wakeState);
 #endif
@@ -776,13 +830,22 @@ void loop()
       Serial.println("");
 
     }
+    if (Si1145_Present)
+    {
+      VisLevel = SI1145.ReadVisible();
+      IRLevel = SI1145.ReadIR();
+      UVLevel = SI1145.ReadUV();
+      Serial.print("//--------------------------------------//\r\n");
+      Serial.print("Vis: "); Serial.println(VisLevel);
+      Serial.print("IR: "); Serial.println(IRLevel);
+      //the real UV value must be div 100 from the reg value , datasheet for more information.
+      Serial.print("UV: ");  Serial.println((float)UVLevel/100);
+    }
 
     // write out the current protocol to message and send.
     int bufferLength;
     bufferLength = buildProtocolString();
-
     Serial.println(F("----------Sending packet----------"));
-
     /*
       /// turn radio on
       digitalWrite(ENABLE_RADIO, LOW);
@@ -811,18 +874,15 @@ void loop()
       //rf95.setTxPower(13, false);
 
       rf95.setFrequency(434.0);
-
       int Bw31_25Cr48Sf512 = 2;
-
+//      rf95.setModemConfig(RH_RF95::Bw31_25Cr48Sf512);
       rf95.setModemConfig(RH_RF95<SoftwareSerial>::ModemConfigChoice(Bw31_25Cr48Sf512));
       // rf95.setModemConfig(RH_RF95::Bw125Cr48Sf4096);
 
-      rf95.setTxPower(13);
+      rf95.setTxPower(TXPOWER);
 
       //rf95.printRegisters();
       Serial.println(F("----------Board Reinitialized----------"));
-
-
     }
     else
     {
@@ -956,6 +1016,7 @@ void loop()
 
   // Pat the WatchDog
   ResetWatchdog();
+  Serial.println();
 
 
 }
